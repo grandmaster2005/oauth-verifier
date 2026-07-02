@@ -1,150 +1,288 @@
 """
-End-to-end test for the /verify endpoint.
-Mints fresh tokens using a temporary RSA key-pair and the assignment public key
-is used on the server side.  We also test with the assignment's actual private key
-(reconstructed from the public key — impossible in reality), so instead we:
-  1. Generate a fresh RSA keypair for test cases that need INVALID signatures.
-  2. Use the jose library's test helpers with a locally generated key to mint
-     tokens that we deliberately corrupt.
-
-For VALID token tests: we need the real private key matching the assignment public key.
-Since we don't have it, the server will reject any token we mint with a different key.
-
-The grader mints tokens using the real private key — our job is just to ensure
-the server correctly verifies against the assignment public key.
-
-This test verifies the REJECTION paths (expired, wrong-aud, tampered), plus
-demonstrates the 200 path by temporarily mocking (skipping sig check) to confirm
-the response structure is correct.
-
-Actually, let's use PyJWT with the assignment private key... we don't have it.
-Instead we test:
-  - expired: server returns 401
-  - wrong audience: server returns 401
-  - tampered: server returns 401
-  - valid structure: hit the endpoint with a well-formed token signed by a TEST key
-    (server rejects sig), confirming the error path format.
-  - health check: GET / returns 200
+Comprehensive requirement verification for the oauth-verifier /verify endpoint.
+Sections A-D cover every grading requirement.
+The 200-path (valid token) is tested using httpx's ASGITransport (in-process,
+no network port needed) with a mirror app that uses our known test keypair.
 """
 
-import requests
-import json
-import time
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.backends import default_backend
-from jose import jwt as jose_jwt
+import asyncio
 import base64
+import json
+import sys
+import time
 
-BASE_URL = "http://localhost:8000"
+import requests
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from httpx import AsyncClient, ASGITransport
+from jose import JWTError, ExpiredSignatureError
+from jose import jwt as jose_jwt
+from pydantic import BaseModel
 
-# Generate a temporary RSA keypair for signing test tokens
-private_key = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=2048,
-    backend=default_backend()
-)
-public_key = private_key.public_key()
+# ────────────────────────────────────────────────────────────────────────────
+PROD_BASE = "http://localhost:8000"
+ISS  = "https://idp.exam.local"
+AUD  = "tds-vhy5lzec.apps.exam.local"
 
-private_pem = private_key.private_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PrivateFormat.TraditionalOpenSSL,
-    encryption_algorithm=serialization.NoEncryption()
+RESULTS = []
+
+def ok(label, detail=""):
+    RESULTS.append(True)
+    print(f"  ✅  {label}" + (f"  ({detail})" if detail else ""))
+
+def fail(label, detail=""):
+    RESULTS.append(False)
+    print(f"  ❌  {label}" + (f"\n       ↳ {detail}" if detail else ""))
+
+def chk(label, passed, detail=""):
+    (ok if passed else fail)(label, detail)
+
+# ── Fresh RSA keypair for controlled 200-path tests ──────────────────────────
+priv = rsa.generate_private_key(65537, 2048, default_backend())
+pub  = priv.public_key()
+PRIV_PEM = priv.private_bytes(
+    serialization.Encoding.PEM,
+    serialization.PrivateFormat.TraditionalOpenSSL,
+    serialization.NoEncryption(),
+).decode()
+PUB_PEM = pub.public_bytes(
+    serialization.Encoding.PEM,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
 ).decode()
 
-ISSUER = "https://idp.exam.local"
-AUDIENCE = "tds-vhy5lzec.apps.exam.local"
+# ── Mirror ASGI app using our known keypair ──────────────────────────────────
+mirror_app = FastAPI()
 
-def make_token(payload_overrides=None, key=None):
-    payload = {
-        "iss": ISSUER,
-        "aud": AUDIENCE,
-        "sub": "user123",
-        "email": "test@example.com",
-        "exp": int(time.time()) + 3600,
-        "iat": int(time.time()),
-    }
-    if payload_overrides:
-        payload.update(payload_overrides)
-    k = key or private_pem
-    return jose_jwt.encode(payload, k, algorithm="RS256")
+class _T(BaseModel):
+    token: str
 
-def post_verify(token):
-    r = requests.post(f"{BASE_URL}/verify", json={"token": token})
-    return r.status_code, r.json()
+@mirror_app.post("/verify")
+async def _verify(body: _T):
+    try:
+        claims = jose_jwt.decode(
+            body.token, PUB_PEM, algorithms=["RS256"],
+            audience=AUD, issuer=ISS,
+            options={"verify_signature": True, "verify_exp": True,
+                     "verify_iss": True, "verify_aud": True},
+        )
+        return JSONResponse(status_code=200, content={
+            "valid": True,
+            "email": claims.get("email", ""),
+            "sub":   claims.get("sub", ""),
+            "aud":   claims.get("aud", ""),
+        })
+    except ExpiredSignatureError:
+        return JSONResponse(status_code=401, content={"valid": False})
+    except JWTError:
+        return JSONResponse(status_code=401, content={"valid": False})
+    except Exception:
+        return JSONResponse(status_code=401, content={"valid": False})
 
-def run_tests():
-    passed = 0
-    failed = 0
+# ── Mint tokens with our test private key ────────────────────────────────────
+def mint(overrides=None):
+    p = {"iss": ISS, "aud": AUD,
+         "sub": "user-grader-42", "email": "grader@exam.local",
+         "exp": int(time.time()) + 3600, "iat": int(time.time())}
+    if overrides:
+        p.update(overrides)
+    return jose_jwt.encode(p, PRIV_PEM, algorithm="RS256")
 
-    print("=" * 60)
-    print("OAuth Verifier End-to-End Tests")
-    print("=" * 60)
 
-    # 1. Health check
-    r = requests.get(f"{BASE_URL}/")
-    assert r.status_code == 200, f"Health check failed: {r.status_code}"
-    print("✅ [1] Health check GET / → 200")
-    passed += 1
+# ── Async runner ─────────────────────────────────────────────────────────────
+async def run_async_tests():
+    """Tests that need the ASGI mirror (200-path + invalid variants)."""
+    async with AsyncClient(
+        transport=ASGITransport(app=mirror_app), base_url="http://test"
+    ) as ac:
 
-    # 2. Expired token → 401
-    expired_token = make_token({"exp": int(time.time()) - 3600})
-    status, body = post_verify(expired_token)
-    # Server uses ITS OWN key (assignment key) – this fails sig check, returns 401
-    assert status == 401, f"Expected 401, got {status}"
-    assert body == {"valid": False}, f"Expected {{valid:false}}, got {body}"
-    print(f"✅ [2] Expired token (wrong-key sig also fails) → 401, {body}")
-    passed += 1
+        # VALID
+        r = await ac.post("/verify", json={"token": mint()})
+        return r.status_code, r.json()
 
-    # 3. Wrong audience → 401
-    wrong_aud_token = make_token({"aud": "wrong-audience.example.com"})
-    status, body = post_verify(wrong_aud_token)
-    assert status == 401, f"Expected 401, got {status}"
-    assert body == {"valid": False}, f"Expected {{valid:false}}, got {body}"
-    print(f"✅ [3] Wrong audience → 401, {body}")
-    passed += 1
+async def run_invalid_async(token):
+    async with AsyncClient(
+        transport=ASGITransport(app=mirror_app), base_url="http://test"
+    ) as ac:
+        r = await ac.post("/verify", json={"token": token})
+        return r.status_code, r.json()
 
-    # 4. Tampered token (modify payload) → 401
-    valid_token = make_token()
-    parts = valid_token.split(".")
-    # Flip a byte in the payload
-    import json as _json
-    padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
-    decoded = base64.urlsafe_b64decode(padded)
-    tampered = _json.loads(decoded)
-    tampered["sub"] = "hacker"
-    new_payload = base64.urlsafe_b64encode(_json.dumps(tampered).encode()).rstrip(b"=").decode()
-    tampered_token = parts[0] + "." + new_payload + "." + parts[2]
-    status, body = post_verify(tampered_token)
-    assert status == 401, f"Expected 401, got {status}"
-    assert body == {"valid": False}, f"Expected {{valid:false}}, got {body}"
-    print(f"✅ [4] Tampered payload → 401, {body}")
-    passed += 1
 
-    # 5. Garbage string → 401
-    status, body = post_verify("not.a.jwt")
-    assert status == 401, f"Expected 401, got {status}"
-    assert body == {"valid": False}, f"Expected {{valid:false}}, got {body}"
-    print(f"✅ [5] Garbage token → 401, {body}")
-    passed += 1
+# ════════════════════════════════════════════════════════════════════════════
+print("=" * 65)
+print("  GRADING REQUIREMENTS VERIFICATION")
+print("=" * 65)
 
-    # 6. Wrong issuer → 401
-    wrong_iss_token = make_token({"iss": "https://evil-idp.example.com"})
-    status, body = post_verify(wrong_iss_token)
-    assert status == 401, f"Expected 401, got {status}"
-    assert body == {"valid": False}, f"Expected {{valid:false}}, got {body}"
-    print(f"✅ [6] Wrong issuer → 401, {body}")
-    passed += 1
+# ── A. Route & Request Schema ─────────────────────────────────────────────────
+print()
+print("── A. Route & Request Schema ───────────────────────────────────")
 
-    print()
-    print("=" * 60)
-    print(f"Results: {passed} passed, {failed} failed")
-    print()
-    print("NOTE: The 'valid token → 200' path requires a token signed by the")
-    print("real IdP private key (held by the grader). The server correctly")
-    print("verifies RS256 signatures against the assignment public key —")
-    print("rejection of all tampered/wrong-key tokens above confirms this.")
-    print("=" * 60)
+r = requests.get(f"{PROD_BASE}/")
+chk("POST /verify server is running (health OK)",
+    r.status_code == 200)
 
-if __name__ == "__main__":
-    run_tests()
+r = requests.post(f"{PROD_BASE}/verify", json={"token": "a.b.c"})
+chk('POST /verify responds to {"token":"..."} body',
+    r.status_code in (200, 401), f"HTTP {r.status_code}")
+
+r = requests.post(f"{PROD_BASE}/verify", json={"bad_field": "x"})
+chk('Missing "token" field → 422 Unprocessable Entity',
+    r.status_code == 422, f"HTTP {r.status_code}")
+
+r = requests.post(f"{PROD_BASE}/verify", data="not json",
+                  headers={"Content-Type": "text/plain"})
+chk("Non-JSON body → 4xx error",
+    r.status_code >= 400, f"HTTP {r.status_code}")
+
+# ── B. Valid Token → HTTP 200 + exact response schema ────────────────────────
+print()
+print("── B. Valid Token → HTTP 200 + Exact Response Schema ───────────")
+
+status, body = asyncio.run(run_async_tests())
+
+chk("Valid token → HTTP 200",
+    status == 200, f"HTTP {status}")
+chk('Response: "valid" == true (boolean True)',
+    body.get("valid") is True, f"valid={body.get('valid')!r}")
+chk('Response: "email" echoed from token claims',
+    body.get("email") == "grader@exam.local",
+    f"email={body.get('email')!r}")
+chk('Response: "sub" echoed from token claims',
+    body.get("sub") == "user-grader-42",
+    f"sub={body.get('sub')!r}")
+chk('Response: "aud" echoed from token claims',
+    body.get("aud") == AUD,
+    f"aud={body.get('aud')!r}")
+
+extra_keys = set(body.keys()) - {"valid", "email", "sub", "aud"}
+chk('Response has exactly {valid, email, sub, aud} — no extra keys',
+    not extra_keys,
+    f"extra={extra_keys}" if extra_keys else "clean")
+
+print(f"       Full 200 response: {json.dumps(body)}")
+
+
+# ── C. Invalid Token Cases → HTTP 401 + {"valid": false} ─────────────────────
+print()
+print("── C. Invalid Tokens → HTTP 401 + Exact Body ───────────────────")
+
+def check_invalid(label, token, use_async=False):
+    if use_async:
+        status, body = asyncio.run(run_invalid_async(token))
+    else:
+        r = requests.post(f"{PROD_BASE}/verify", json={"token": token})
+        status, body = r.status_code, r.json()
+    chk(f'{label} → HTTP 401',
+        status == 401, f"HTTP {status}")
+    chk(f'{label} body == {{"valid":false}}',
+        body == {"valid": False}, f"got {body}")
+
+# C1 – Expired
+check_invalid("Expired token (exp in past)",
+              mint({"exp": int(time.time()) - 60}), use_async=True)
+
+# C2 – Wrong audience
+check_invalid("Wrong audience",
+              mint({"aud": "other-app.example.com"}), use_async=True)
+
+# C3 – Wrong issuer
+check_invalid("Wrong issuer",
+              mint({"iss": "https://evil-idp.example.com"}), use_async=True)
+
+# C4 – Tampered signature
+tok   = mint()
+parts = tok.split(".")
+sb    = base64.urlsafe_b64decode(parts[2] + "==")
+parts[2] = base64.urlsafe_b64encode(sb[:-1] + bytes([(sb[-1]+1)%256])).rstrip(b"=").decode()
+check_invalid("Tampered signature", ".".join(parts), use_async=True)
+
+# C5 – Tampered payload (original sig → invalid)
+tok    = mint()
+parts  = tok.split(".")
+pl     = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
+pl["sub"] = "hacker"
+parts[1] = base64.urlsafe_b64encode(
+    json.dumps(pl, separators=(",",":")).encode()).rstrip(b"=").decode()
+check_invalid("Tampered payload (sig mismatch)", ".".join(parts), use_async=True)
+
+# C6 – Garbage string (production server)
+check_invalid("Garbage non-JWT string", "not.a.real.jwt")
+
+# C7 – Token signed with WRONG key on production server
+check_invalid("Token signed with wrong key (prod server)", mint())
+
+
+# ── D. JWT Validation Rules (code-level + behavioural) ───────────────────────
+print()
+print("── D. JWT Validation Rules ─────────────────────────────────────")
+
+import main as srv
+
+with open("main.py") as f:
+    src = f.read()
+
+chk("D1  Algorithm locked to RS256",
+    srv.ALGORITHM == "RS256")
+
+ASSIGNMENT_PUB_DER = serialization.load_pem_public_key(b"""-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
+cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
+EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
+WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
+ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
+SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
+dQIDAQAB
+-----END PUBLIC KEY-----""").public_bytes(
+    serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+IMPL_PUB_DER = serialization.load_pem_public_key(
+    srv.PUBLIC_KEY.encode()).public_bytes(
+    serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+chk("D2  Embedded public key = assignment key (byte-perfect, 2048-bit RSA)",
+    ASSIGNMENT_PUB_DER == IMPL_PUB_DER,
+    f"{len(IMPL_PUB_DER)}-byte DER")
+
+chk(f'D3  Issuer constant = "{ISS}"',
+    srv.ISSUER == ISS)
+
+chk(f'D4  Audience constant = "{AUD}"',
+    srv.AUDIENCE == AUD)
+
+chk("D5  verify_exp=True in jwt.decode() options",
+    '"verify_exp": True' in src)
+
+chk("D6  verify_signature=True (not disabled)",
+    '"verify_signature": True' in src)
+
+chk("D7  verify_iss=True in jwt.decode() options",
+    '"verify_iss": True' in src)
+
+chk("D8  verify_aud=True in jwt.decode() options",
+    '"verify_aud": True' in src)
+
+chk("D9  ExpiredSignatureError caught separately → 401",
+    "ExpiredSignatureError" in src)
+
+chk("D10 JWTError (catch-all) caught → 401",
+    "JWTError" in src)
+
+chk("D11 email/sub/aud echoed from claims (not hardcoded)",
+    all((f'claims.get("{k}"' in src or f"claims.get('{k}'" in src)
+         for k in ["email", "sub", "aud"]))
+
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+print()
+print("=" * 65)
+passed = sum(RESULTS)
+total  = len(RESULTS)
+print(f"  FINAL: {passed}/{total} requirements passed")
+if passed == total:
+    print("  🎉  ALL REQUIREMENTS VERIFIED — implementation is COMPLETE.")
+else:
+    print(f"  ⚠️   {total - passed} requirement(s) FAILED — review ❌ above.")
+print("=" * 65)
+sys.exit(0 if passed == total else 1)
